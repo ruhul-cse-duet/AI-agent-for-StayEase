@@ -23,5 +23,5 @@ if errorlevel 1 (
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 )
 
-echo [INFO] Starting StayEase API on http://127.0.0.1:8001
+echo [INFO] Starting StayEase API on http://localhost:8001/docs
 ".venv\Scripts\python.exe" -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload

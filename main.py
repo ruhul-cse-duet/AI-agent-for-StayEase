@@ -2,11 +2,6 @@
 main.py
 -------
 FastAPI application for the StayEase AI booking agent.
-
-Endpoints
----------
-POST /api/chat/{conversation_id}/message   — Send a guest message
-GET  /api/chat/{conversation_id}/history   — Retrieve conversation history
 """
 
 from __future__ import annotations
@@ -16,22 +11,20 @@ import os
 from datetime import datetime, timezone
 from typing import Literal
 
+from dotenv import load_dotenv
+load_dotenv()   # ← .env ফাইল থেকে GROQ_API_KEY, DATABASE_URL লোড করে
+
 import psycopg2
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
-
-load_dotenv()
 
 from agent.graph import run_agent
 from agent.nodes import SYSTEM_PROMPT
 from agent.state import AgentState
 
-
-# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="StayEase AI Agent API",
@@ -47,16 +40,12 @@ app.add_middleware(
 )
 
 
-# ── DB helper ─────────────────────────────────────────────────────────────────
-
 def _db():
     return psycopg2.connect(os.environ["DATABASE_URL"], cursor_factory=RealDictCursor)
 
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
-
 class MessageRequest(BaseModel):
-    content: str = Field(..., min_length=1, max_length=2000, description="Guest message text")
+    content: str = Field(..., min_length=1, max_length=2000)
 
 
 class MessageEntry(BaseModel):
@@ -77,32 +66,23 @@ class HistoryResponse(BaseModel):
     messages: list[MessageEntry]
 
 
-# ── Persistence helpers ───────────────────────────────────────────────────────
-
 def _load_history(conversation_id: str) -> list[dict]:
-    """Return stored messages for a conversation, or []."""
     with _db() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT messages FROM conversations WHERE id = %s", (conversation_id,)
-        )
+        cur.execute("SELECT messages FROM conversations WHERE id = %s", (conversation_id,))
         row = cur.fetchone()
     return row["messages"] if row else []
 
 
 def _save_turn(conversation_id: str, user_content: str, assistant_content: str, intent: str):
-    """Upsert the conversation row with the latest two messages."""
     now = datetime.now(timezone.utc).isoformat()
     with _db() as conn, conn.cursor() as cur:
         cur.execute("SELECT messages FROM conversations WHERE id = %s", (conversation_id,))
         row = cur.fetchone()
         existing: list = row["messages"] if row else []
-
-        new_entries = [
-            {"role": "user",      "content": user_content,      "timestamp": now},
-            {"role": "assistant", "content": assistant_content,  "timestamp": now},
+        updated = existing + [
+            {"role": "user",      "content": user_content,     "timestamp": now},
+            {"role": "assistant", "content": assistant_content, "timestamp": now},
         ]
-        updated = existing + new_entries
-
         cur.execute(
             """
             INSERT INTO conversations (id, messages, intent_last, updated_at)
@@ -117,32 +97,16 @@ def _save_turn(conversation_id: str, user_content: str, assistant_content: str, 
         conn.commit()
 
 
-# ── Endpoint 1 — POST /api/chat/{conversation_id}/message ────────────────────
-
-@app.post(
-    "/api/chat/{conversation_id}/message",
-    response_model=MessageResponse,
-    summary="Send a guest message and receive an AI reply",
-)
+@app.post("/api/chat/{conversation_id}/message", response_model=MessageResponse)
 def send_message(conversation_id: str, body: MessageRequest):
-    """
-    Accept a natural-language message from a StayEase guest and run the
-    LangGraph agent to produce a reply.
-
-    The agent handles search, details, and booking intents.
-    Anything outside those three is escalated to human support.
-    """
-    # 1. Rebuild LangChain message history from DB
+    """Send a guest message and get an AI reply."""
     raw_history = _load_history(conversation_id)
     lc_messages = [SystemMessage(content=SYSTEM_PROMPT)]
     for entry in raw_history:
-        if entry["role"] == "user":
-            lc_messages.append(HumanMessage(content=entry["content"]))
-        else:
-            lc_messages.append(AIMessage(content=entry["content"]))
+        cls = HumanMessage if entry["role"] == "user" else AIMessage
+        lc_messages.append(cls(content=entry["content"]))
     lc_messages.append(HumanMessage(content=body.content))
 
-    # 2. Build initial state and run agent
     initial_state: AgentState = {
         "conversation_id": conversation_id,
         "messages":        lc_messages,
@@ -152,16 +116,13 @@ def send_message(conversation_id: str, body: MessageRequest):
         "final_response":  "",
         "error":           None,
     }
-
     try:
         final_state: AgentState = run_agent(initial_state)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
 
-    reply        = final_state.get("final_response", "")
-    intent_used  = final_state.get("intent", "unknown")
-
-    # 3. Persist turn
+    reply       = final_state.get("final_response", "")
+    intent_used = final_state.get("intent", "unknown")
     _save_turn(conversation_id, body.content, reply, intent_used)
 
     return MessageResponse(
@@ -172,27 +133,15 @@ def send_message(conversation_id: str, body: MessageRequest):
     )
 
 
-# ── Endpoint 2 — GET /api/chat/{conversation_id}/history ─────────────────────
-
-@app.get(
-    "/api/chat/{conversation_id}/history",
-    response_model=HistoryResponse,
-    summary="Retrieve the full conversation history",
-)
+@app.get("/api/chat/{conversation_id}/history", response_model=HistoryResponse)
 def get_history(conversation_id: str):
-    """
-    Return every message (user and assistant) for the given conversation_id.
-
-    Returns an empty list when the conversation has not started yet.
-    """
+    """Return full conversation history."""
     messages = _load_history(conversation_id)
     return HistoryResponse(
         conversation_id=conversation_id,
         messages=[MessageEntry(**m) for m in messages],
     )
 
-
-# ── Health check ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
