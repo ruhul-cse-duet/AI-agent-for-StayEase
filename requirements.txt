@@ -1,0 +1,9 @@
+fastapi>=0.130.0
+uvicorn[standard]>=0.30.6
+langgraph>=1.1.0
+langchain-core>=1.3.0
+langchain-groq>=1.0.0
+langchain-openai>=1.0.0       # for LM Studio / OpenRouter
+psycopg2-binary>=2.9.9
+pydantic>=2.9.2
+python-dotenv>=1.0.1
