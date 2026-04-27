@@ -142,7 +142,13 @@ def send_message(conversation_id: str, body: MessageRequest):
 @app.post("/api/chat/message", response_model=MessageResponse)
 def send_message_auto_id(body: MessageRequest):
     """Send message without path conversation_id; server creates one if missing."""
-    conversation_id = body.conversation_id or f"conv_{uuid4().hex}"
+    provided_id = (body.conversation_id or "").strip()
+    invalid_placeholders = {"", "string", "null", "none", "undefined"}
+    conversation_id = (
+        f"conv_{uuid4().hex}"
+        if provided_id.lower() in invalid_placeholders
+        else provided_id
+    )
     return send_message(conversation_id=conversation_id, body=body)
 
 

@@ -44,6 +44,13 @@ class DetailsInput(BaseModel):
     listing_id: int = Field(..., description="Unique ID of the listing to look up")
 
 
+class DetailsByNameInput(BaseModel):
+    """Parameters needed to fetch listing details by name."""
+
+    listing_name: str = Field(..., min_length=2, description="Property name, e.g. 'Rose View Hotel Sylhet'")
+    location: str | None = Field(default=None, description="Optional location hint, e.g. 'Sylhet'")
+
+
 class BookingInput(BaseModel):
     """Parameters needed to create a new booking."""
 
@@ -141,6 +148,59 @@ def get_listing_details(listing_id: int) -> dict[str, Any]:
     return dict(row) if row else {}
 
 
+@tool("get_listing_details_by_name", args_schema=DetailsByNameInput)
+def get_listing_details_by_name(listing_name: str, location: str | None = None) -> dict[str, Any]:
+    """
+    Retrieve full details for a listing by fuzzy name (optionally narrowed by location).
+    Returns {} when no active listing matches.
+    """
+    clean_name = listing_name.strip()
+    clean_location = location.strip() if isinstance(location, str) and location.strip() else None
+
+    sql = """
+        SELECT
+            id              AS listing_id,
+            name,
+            location,
+            address,
+            description,
+            price_per_night_bdt,
+            max_guests,
+            amenities,
+            host_name,
+            host_phone
+        FROM listings
+        WHERE
+            is_active = TRUE
+            AND LOWER(name) LIKE LOWER(%(name_like)s)
+            AND (
+                %(location)s IS NULL
+                OR LOWER(location) LIKE LOWER(%(location_like)s)
+            )
+        ORDER BY
+            CASE
+                WHEN LOWER(name) = LOWER(%(name_exact)s) THEN 0
+                WHEN LOWER(name) LIKE LOWER(%(name_prefix)s) THEN 1
+                ELSE 2
+            END,
+            LENGTH(name) ASC
+        LIMIT 1;
+    """
+    with _get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            sql,
+            {
+                "name_like": f"%{clean_name}%",
+                "name_exact": clean_name,
+                "name_prefix": f"{clean_name}%",
+                "location": clean_location,
+                "location_like": f"%{clean_location}%" if clean_location else None,
+            },
+        )
+        row = cur.fetchone()
+    return dict(row) if row else {}
+
+
 # ── Tool 3 — book ─────────────────────────────────────────────────────────────
 
 @tool("create_booking", args_schema=BookingInput)
@@ -216,5 +276,5 @@ def create_booking(
 
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
-ALL_TOOLS = [search_available_properties, get_listing_details, create_booking]
+ALL_TOOLS = [search_available_properties, get_listing_details, get_listing_details_by_name, create_booking]
 TOOL_MAP: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
