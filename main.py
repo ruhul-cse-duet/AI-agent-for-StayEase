@@ -10,6 +10,7 @@ import json
 import os
 from datetime import datetime, timezone
 from typing import Literal
+from uuid import uuid4
 
 from dotenv import load_dotenv
 load_dotenv()   # ← .env ফাইল থেকে GROQ_API_KEY, DATABASE_URL লোড করে
@@ -46,6 +47,7 @@ def _db():
 
 class MessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=2000)
+    conversation_id: str | None = None
 
 
 class MessageEntry(BaseModel):
@@ -97,7 +99,11 @@ def _save_turn(conversation_id: str, user_content: str, assistant_content: str, 
         conn.commit()
 
 
-@app.post("/api/chat/{conversation_id}/message", response_model=MessageResponse)
+@app.post(
+    "/api/chat/{conversation_id}/message",
+    response_model=MessageResponse,
+    include_in_schema=False,
+)
 def send_message(conversation_id: str, body: MessageRequest):
     """Send a guest message and get an AI reply."""
     raw_history = _load_history(conversation_id)
@@ -131,6 +137,13 @@ def send_message(conversation_id: str, body: MessageRequest):
         intent=intent_used,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@app.post("/api/chat/message", response_model=MessageResponse)
+def send_message_auto_id(body: MessageRequest):
+    """Send message without path conversation_id; server creates one if missing."""
+    conversation_id = body.conversation_id or f"conv_{uuid4().hex}"
+    return send_message(conversation_id=conversation_id, body=body)
 
 
 @app.get("/api/chat/{conversation_id}/history", response_model=HistoryResponse)

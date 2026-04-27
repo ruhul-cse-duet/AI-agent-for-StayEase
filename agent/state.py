@@ -1,68 +1,86 @@
 """
 agent/state.py
 --------------
-Defines the single source of truth that flows through every LangGraph node.
+LangGraph state definition for the StayEase booking agent.
+
+Key LangGraph concept:
+  - AgentState is a TypedDict passed through every node.
+  - The `messages` field uses `Annotated[..., add_messages]` — this is the
+    LangGraph reducer pattern. When a node returns {"messages": [new_msg]},
+    LangGraph calls add_messages(existing, [new_msg]) to accumulate — nodes
+    never need to manage the full list themselves.
+  - All other fields are plain values; nodes return partial dicts and LangGraph
+    does a shallow merge (last-write-wins per key).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Annotated
 from typing_extensions import TypedDict
-from langchain_core.messages import BaseMessage
+
+# LangGraph-native imports
+from langgraph.graph.message import add_messages   # ← the reducer
+from langchain_core.messages import BaseMessage    # shared message base type
 
 
 class AgentState(TypedDict):
     """
-    Shared state object passed between every node in the StayEase agent graph.
+    Single source of truth that flows through every node in the graph.
 
-    All fields are optional-by-default so nodes only update what they own;
-    LangGraph merges partial dicts on each transition.
+    LangGraph merges partial dicts returned by each node back into this state.
+    The `add_messages` reducer on `messages` means nodes append — not replace.
     """
 
     # ── Session ───────────────────────────────────────────────────────────────
     conversation_id: str
-    """Client-supplied ID that links this run to the conversations DB row."""
+    """Ties this run to a row in the conversations DB table."""
 
-    # ── LLM context ───────────────────────────────────────────────────────────
-    messages: list[BaseMessage]
+    # ── LLM message history (LangGraph-managed) ───────────────────────────────
+    messages: Annotated[list[BaseMessage], add_messages]
     """
-    Full chat history (HumanMessage / AIMessage / ToolMessage).
-    Fed to the LLM on every node that needs conversational context.
+    Accumulated chat history: SystemMessage → HumanMessage(s) → AIMessage(s).
+
+    Uses LangGraph's `add_messages` reducer so nodes just return the *new*
+    message(s) they produce; LangGraph appends them automatically.
+
+    Example — what a node should return:
+        return {"messages": [AIMessage(content="Hello!")]}
+        # NOT: return {"messages": state["messages"] + [AIMessage(...)]}
     """
 
     # ── Routing ───────────────────────────────────────────────────────────────
     intent: str
     """
-    Classified intent.
-    One of: "search" | "details" | "book" | "escalate" | "unknown"
-    Set by intent_router; read by the conditional edge.
+    Intent classified by the LLM.
+    One of: "search" | "details" | "book" | "escalate"
+    Written by intent_router; read by the conditional edge in graph.py.
     """
 
     # ── Tool layer ────────────────────────────────────────────────────────────
     tool_input: dict[str, Any]
     """
-    Structured parameters extracted from the guest message.
-    Passed directly into the tool function by tool_executor.
+    Structured parameters extracted from the guest message, ready to pass
+    directly to the tool function.
     Example: {"location": "Cox's Bazar", "check_in": "2025-08-01",
                "check_out": "2025-08-03", "guests": 2}
     """
 
     tool_output: Any
     """
-    Raw value returned by the tool (list[dict] for search, dict for details/book).
-    Consumed by response_node to generate the guest-facing reply.
+    Raw value returned by the tool.
+    list[dict] for search, dict for details/book, None on error.
     """
 
-    # ── Output ────────────────────────────────────────────────────────────────
+    # ── Final output ──────────────────────────────────────────────────────────
     final_response: str
     """
-    Human-readable reply to be returned to the guest via FastAPI.
-    Always written before the graph reaches END.
+    Human-readable reply sent back to the guest via FastAPI.
+    Always populated before the graph reaches END.
     """
 
-    # ── Error handling ────────────────────────────────────────────────────────
+    # ── Error channel ─────────────────────────────────────────────────────────
     error: str | None
     """
-    Non-None when a recoverable error occurred (e.g. DB timeout, LLM parse fail).
-    response_node converts this into a polite apology message.
+    Set to an error message string when a node fails gracefully.
+    response_node converts this into a polite apology for the guest.
     """
