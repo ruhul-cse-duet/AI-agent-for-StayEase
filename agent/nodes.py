@@ -1,371 +1,457 @@
 """
-Node functions for the StayEase LangGraph agent.
-"""
+agent/nodes.py  (v5 — full multi-turn booking flow)
+-----------------------------------------------------
+Enforces a 4-step guest journey:
+  1. SEARCH   → show all results numbered, ask "which one?"
+  2. DETAILS  → show full property info, ask for name + phone
+  3. COLLECT  → gather guest_name and guest_phone (one ask at a time)
+  4. BOOK     → call create_booking only when ALL 6 fields are ready
 
+Supports both large (tool-calling) and small (JSON fallback) LLMs.
+"""
 from __future__ import annotations
 
 import json
 import os
 import re
+from datetime import date
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent.state import AgentState
-from agent.tools import TOOL_MAP
+from agent.tools import ALL_TOOLS, TOOL_MAP
 
 
-_llm = None
+# ── LLM factory ───────────────────────────────────────────────────────────────
 
-_GREETING_WORDS = {
-    "hi",
-    "hello",
-    "hey",
-    "assalamu",
-    "assalamualaikum",
-    "salam",
-    "goodmorning",
-    "goodafternoon",
-    "goodevening",
-}
-
-_PROPERTY_WORDS = {"hotel", "resort", "villa", "apartment", "property", "room", "rooms"}
-_DETAIL_WORDS = {"detail", "details", "info", "information", "about", "describe", "describe", "know"}
-_SEARCH_WORDS = {"search", "find", "available", "availability", "options", "list", "show"}
-_BOOK_WORDS = {"book", "booking", "reserve", "reservation", "confirm"}
-
-_KNOWN_LOCATIONS = {
-    "sylhet": "Sylhet",
-    "sajek": "Sajek",
-    "dhaka": "Dhaka",
-    "chittagong": "Chittagong",
-    "ctg": "Chittagong",
-}
+_llm_with_tools = None
+_llm_plain = None
 
 
-def _get_llm():
-    """Return a cached LLM instance, building it on first call."""
-    global _llm
-    if _llm is not None:
-        return _llm
+def _get_llm(with_tools: bool = True):
+    global _llm_with_tools, _llm_plain
+    cached = _llm_with_tools if with_tools else _llm_plain
+    if cached is not None:
+        return cached
 
+    # Increase default tokens so full search results fit
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
     base_url = os.getenv("LM_STUDIO_BASE_URL")
+
     if base_url:
         from langchain_openai import ChatOpenAI
-
-        _llm = ChatOpenAI(
+        base = ChatOpenAI(
             base_url=base_url,
             api_key="lm-studio",
             model=os.getenv("LM_STUDIO_MODEL", "local-model"),
             temperature=0,
+            max_tokens=max_tokens,
         )
     else:
         from langchain_groq import ChatGroq
-
-        _llm = ChatGroq(
+        base = ChatGroq(
             api_key=os.environ["GROQ_API_KEY"],
             model=os.getenv("GROQ_MODEL", "llama3-70b-8192"),
             temperature=0,
+            max_tokens=max_tokens,
         )
-    return _llm
+
+    if with_tools:
+        _llm_with_tools = base.bind_tools(ALL_TOOLS)
+        return _llm_with_tools
+    else:
+        _llm_plain = base
+        return _llm_plain
 
 
-def _normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+# ── System prompt (large model) ───────────────────────────────────────────────
 
+SYSTEM_PROMPT_TEMPLATE = """\
+You are Riya, a warm and professional booking receptionist for StayEase — Bangladesh's top hotel rental platform.
 
-def _tokenize(text: str) -> list[str]:
-    normalized = re.sub(r"[^a-zA-Z0-9\s']", " ", text or "").lower()
-    return [t for t in normalized.split() if t]
+TODAY: {today}
 
+CURRENT BOOKING IN PROGRESS:
+{pending_json}
 
-def _last_user_message(state: AgentState) -> str:
-    for msg in reversed(state.get("messages", [])):
-        if isinstance(msg, HumanMessage):
-            return _normalize_text(msg.content)
-    return ""
+══════════════════════════════════════════════════════════════
+GUEST JOURNEY — follow these steps in strict order:
+══════════════════════════════════════════════════════════════
 
+STEP 1 ▶ SEARCH (user wants a room / hotel)
+  • If location, check-in, check-out, or guests are missing → ask for them FIRST.
+  • Then call: search_available_properties(location, check_in, check_out, guests)
+  • Present ALL results as a numbered list, one property per line:
+        1. Sea Pearl Beach Resort — ৳8,500/night — WiFi, Pool, Sea View — max 4 guests
+        2. Long Beach Hotel      — ৳5,200/night — WiFi, AC, Sea View   — max 2 guests
+  • End with: "Which property would you like to book? 😊"
 
-def _is_greeting_only(text: str) -> bool:
-    tokens = _tokenize(text)
-    if not tokens:
-        return False
-    compact = "".join(tokens)
-    return compact in _GREETING_WORDS or all(t in _GREETING_WORDS for t in tokens)
+STEP 2 ▶ PROPERTY SELECTED (user picks one by name or number)
+  • Call: get_listing_details_by_name(listing_name)
+  • Show: name, address, price/night, amenities, host contact.
+  • Ask: "Great choice! To confirm your booking, please share your full name and phone number."
 
+STEP 3 ▶ COLLECT GUEST INFO
+  • If guest_name is missing in CURRENT BOOKING → ask: "May I have your full name please?"
+  • If guest_phone is missing in CURRENT BOOKING → ask: "And your phone number? (e.g. +8801XXXXXXXXX)"
+  • Do NOT skip this step. Do NOT proceed to Step 4 until BOTH are provided.
 
-def _extract_date_pair(text: str) -> tuple[str | None, str | None]:
-    dates = re.findall(r"\d{4}-\d{2}-\d{2}", text or "")
-    if len(dates) >= 2:
-        return dates[0], dates[1]
-    return None, None
+STEP 4 ▶ CONFIRM BOOKING (only when ALL 6 fields are ready)
+  Required fields (check CURRENT BOOKING above):
+    ✓ listing_id   ✓ check_in   ✓ check_out   ✓ guests   ✓ guest_name   ✓ guest_phone
+  • Call: create_booking(listing_id, guest_name, guest_phone, check_in, check_out, guests)
+  • Reply with full confirmation:
+        ✅ Booking confirmed! 
+        🏨 Property : Long Beach Hotel
+        📅 Dates    : 2026-05-01 → 2026-05-03 (2 nights)
+        👥 Guests   : 2
+        💳 Total    : ৳10,400
+        📋 Booking ID: #42
+        "Thank you, Ruhul! Have a wonderful stay. 🌊"
 
+══════════════════════════════════════════════════════════════
+STRICT RULES:
+  ❌ NEVER call create_booking without guest_name AND guest_phone.
+  ❌ NEVER guess prices, IDs, or availability — always use tools.
+  ❌ NEVER skip the search step — always show options before booking.
+  ✅ Use ৳ for prices (e.g. ৳5,200/night, ৳10,400 total).
+  ✅ Keep replies concise — max 8 sentences per turn.
+  ✅ Unrelated questions → "I can only help with StayEase bookings. Call 16700 or email support@stayease.com.bd."
+══════════════════════════════════════════════════════════════
+"""
 
-def _extract_guests(text: str) -> int | None:
-    m = re.search(r"\b(\d{1,2})\s*(?:guest|guests|people|person|persons)\b", text.lower())
-    return int(m.group(1)) if m else None
+# ── System prompt (small local model JSON fallback) ───────────────────────────
 
+SYSTEM_PROMPT_JSON = """You are Riya, a booking assistant for StayEase Bangladesh.
+Output ONLY a single JSON object — no explanation, no markdown, no extra text.
 
-def _extract_location_hint(text: str) -> str | None:
-    tokens = _tokenize(text)
-    if "cox" in tokens and "bazar" in tokens:
-        return "Cox's Bazar"
-    if "coxs" in tokens and "bazar" in tokens:
-        return "Cox's Bazar"
+JSON format:
+{"intent": "<search|details|book|collect|escalate>", "tool_input": {}}
 
-    for token in tokens:
-        if token in _KNOWN_LOCATIONS:
-            return _KNOWN_LOCATIONS[token]
-    return None
-
-
-def _extract_listing_name(text: str) -> str | None:
-    compact = _normalize_text(text)
-    patterns = [
-        r"(?:about|for|of)\s+([a-zA-Z0-9' -]{3,}(?:hotel|resort|villa|apartment)[a-zA-Z0-9' -]*)",
-        r"(?:details\s+of|information\s+for)\s+([a-zA-Z0-9' -]{3,})",
-    ]
-    for p in patterns:
-        m = re.search(p, compact, flags=re.IGNORECASE)
-        if m:
-            return _normalize_text(m.group(1).strip(" .,!?:;"))
-
-    m = re.search(r"([a-zA-Z0-9' -]{3,}(?:hotel|resort|villa|apartment)[a-zA-Z0-9' -]*)", compact, flags=re.IGNORECASE)
-    if m:
-        return _normalize_text(m.group(1).strip(" .,!?:;"))
-    return None
-
-
-def _heuristic_intent_and_input(text: str) -> tuple[str, dict[str, Any]] | None:
-    tokens = set(_tokenize(text))
-    if not tokens:
-        return None
-
-    listing_id_match = re.search(r"\b(?:listing|property)\s*#?\s*(\d+)\b", text.lower())
-    listing_name = _extract_listing_name(text)
-    location = _extract_location_hint(text)
-    check_in, check_out = _extract_date_pair(text)
-    guests = _extract_guests(text)
-
-    if listing_id_match:
-        return "details", {"listing_id": int(listing_id_match.group(1))}
-
-    if tokens & _BOOK_WORDS:
-        tool_input: dict[str, Any] = {}
-        if listing_name:
-            tool_input["listing_name"] = listing_name
-        if check_in and check_out:
-            tool_input["check_in"] = check_in
-            tool_input["check_out"] = check_out
-        if guests:
-            tool_input["guests"] = guests
-        return "book", tool_input
-
-    if (tokens & _DETAIL_WORDS) and listing_name:
-        tool_input = {"listing_name": listing_name}
-        if location:
-            tool_input["location"] = location
-        return "details", tool_input
-
-    if (tokens & _SEARCH_WORDS) or (tokens & _PROPERTY_WORDS) or location:
-        tool_input = {}
-        if location:
-            tool_input["location"] = location
-        if check_in and check_out:
-            tool_input["check_in"] = check_in
-            tool_input["check_out"] = check_out
-        if guests:
-            tool_input["guests"] = guests
-        return "search", tool_input
-
-    return None
-
-
-def _normalize_search_input(tool_input: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    normalized: dict[str, Any] = dict(tool_input or {})
-
-    if "guests" not in normalized:
-        for alias in ("guest_count", "guest", "people", "persons"):
-            if alias in normalized and normalized[alias] not in ("", None):
-                normalized["guests"] = normalized[alias]
-                break
-
-    if ("check_in" not in normalized or "check_out" not in normalized) and "dates" in normalized:
-        check_in, check_out = _extract_date_pair(str(normalized.get("dates", "")))
-        if check_in and check_out:
-            normalized["check_in"] = check_in
-            normalized["check_out"] = check_out
-
-    if not normalized.get("location"):
-        return {}, "Please share the location/city for your stay."
-    if not normalized.get("check_in") or not normalized.get("check_out"):
-        return {}, "Please share check-in and check-out dates in YYYY-MM-DD format."
-    if not normalized.get("guests"):
-        return {}, "Please share how many guests will stay."
-
-    return normalized, None
-
-
-SYSTEM_PROMPT = """You are the StayEase booking assistant for a short-term rental platform in Bangladesh.
-You handle:
-1) Search available properties (location + dates + guests)
-2) Property details (by listing_id or listing_name)
-3) Booking confirmation
-
-Return STRICT JSON only:
-{
-  "intent": "<search|details|book|escalate>",
-  "tool_input": { ... }
-}
-
-Rules:
-- Dates: YYYY-MM-DD
-- For details intent, prefer listing_id; if unavailable use listing_name
-- If message is outside StayEase scope, use "escalate"
-- Never invent listing IDs or prices
+Intent rules:
+- "search"  → user wants to find rooms
+  tool_input: {"location": "...", "check_in": "YYYY-MM-DD", "check_out": "YYYY-MM-DD", "guests": N}
+- "details" → user picks a property by name
+  tool_input: {"listing_name": "<property name>"}
+- "book"    → all info available: listing_id, guest_name, guest_phone, dates, guests
+  tool_input: {"listing_id": N, "guest_name": "...", "guest_phone": "...", "check_in": "...", "check_out": "...", "guests": N}
+- "collect" → waiting for guest name/phone → no tool call needed
+  tool_input: {}
+- "escalate" → unrelated question
+  tool_input: {}
 """
 
 
-def input_node(state: AgentState) -> dict[str, Any]:
-    if not state.get("messages"):
-        return {"messages": [SystemMessage(content=SYSTEM_PROMPT)], "error": None}
-    return {"error": None}
+# ── Helper: detect small model ────────────────────────────────────────────────
+
+def _is_small_model() -> bool:
+    model = os.getenv("LM_STUDIO_MODEL", "").lower()
+    small_hints = ["1.5b", "1b", "3b", "deepseek-r1-distill-qwen-1.5", "qwen-1.5b"]
+    return any(h in model for h in small_hints) or bool(os.getenv("FORCE_JSON_MODE"))
 
 
-def intent_router(state: AgentState) -> dict[str, Any]:
-    user_text = _last_user_message(state)
+# ── Helper: JSON extractor ────────────────────────────────────────────────────
 
-    if _is_greeting_only(user_text):
-        parsed = {"intent": "escalate", "tool_input": {}}
-        return {
-            "intent": "escalate",
-            "tool_input": {},
-            "messages": [AIMessage(content=json.dumps(parsed))],
-        }
+def _extract_json(text: str) -> dict:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return {"intent": "escalate", "tool_input": {}}
 
-    heuristic = _heuristic_intent_and_input(user_text)
-    if heuristic:
-        intent, tool_input = heuristic
-        return {
-            "intent": intent,
-            "tool_input": tool_input,
-            "messages": [AIMessage(content=json.dumps({"intent": intent, "tool_input": tool_input}))],
-        }
 
-    llm = _get_llm()
-    raw = str(llm.invoke(state["messages"]).content).strip()
-    try:
-        parsed: dict[str, Any] = json.loads(raw)
-        intent = str(parsed.get("intent", "escalate"))
-        tool_input = parsed.get("tool_input", {}) or {}
-    except (json.JSONDecodeError, TypeError):
-        intent = "escalate"
-        tool_input = {}
-        raw = json.dumps({"intent": intent, "tool_input": tool_input})
+# ── Helper: build pending_booking summary for prompt ─────────────────────────
 
-    return {
-        "intent": intent,
-        "tool_input": tool_input,
-        "messages": [AIMessage(content=raw)],
+def _pending_summary(pending: dict) -> str:
+    if not pending:
+        return "None — waiting for guest's request."
+    lines = []
+    field_labels = {
+        "location":     "Location",
+        "check_in":     "Check-in",
+        "check_out":    "Check-out",
+        "guests":       "Guests",
+        "listing_id":   "Listing ID",
+        "listing_name": "Property",
+        "guest_name":   "Guest Name",
+        "guest_phone":  "Guest Phone",
     }
+    for key, label in field_labels.items():
+        val = pending.get(key)
+        status = f"✓ {val}" if val else "✗ MISSING"
+        lines.append(f"  {label:<14}: {status}")
+    return "\n".join(lines)
 
 
-def tool_executor(state: AgentState) -> dict[str, Any]:
-    intent = state.get("intent", "")
-    tool_input = state.get("tool_input", {}) or {}
+# ── Helper: reply formatter for small-model JSON path ────────────────────────
 
-    if intent == "search":
-        tool_name = "search_available_properties"
-        normalized, input_error = _normalize_search_input(tool_input)
-        if input_error:
-            return {"tool_output": None, "error": input_error}
-        tool_input = normalized
-
-    elif intent == "details":
-        if tool_input.get("listing_id"):
-            tool_name = "get_listing_details"
-        elif tool_input.get("listing_name"):
-            tool_name = "get_listing_details_by_name"
-        else:
-            return {"tool_output": None, "error": "Please share the property name or listing ID for details."}
-
-    elif intent == "book":
-        tool_name = "create_booking"
-        required = ("listing_id", "guest_name", "guest_phone", "check_in", "check_out", "guests")
-        if any(not tool_input.get(k) for k in required):
-            return {
-                "tool_output": None,
-                "error": "To confirm booking, please provide listing ID, guest name, phone, check-in, check-out, and guests.",
-            }
-
-    else:
-        return {"tool_output": None, "error": f"No tool mapped for intent '{intent}'"}
-
-    tool_fn = TOOL_MAP.get(tool_name)
-    if not tool_fn:
-        return {"tool_output": None, "error": f"Tool '{tool_name}' is not available."}
-
-    try:
-        return {"tool_output": tool_fn.invoke(tool_input), "error": None}
-    except Exception as exc:  # noqa: BLE001
-        return {"tool_output": None, "error": str(exc)}
-
-
-def response_node(state: AgentState) -> dict[str, Any]:
-    if state.get("error"):
-        return {"final_response": str(state["error"])}
-
-    tool_output = state.get("tool_output")
-    intent = state.get("intent", "unknown")
-
-    if intent == "details" and not tool_output:
-        return {"final_response": "I could not find that property. Please share the exact listing name or listing ID."}
+def _format_reply(intent: str, tool_output: Any, error: str | None) -> str:
+    if error:
+        return f"Sorry, I ran into a problem: {error}. Please try again or call 16700."
 
     prompt_map = {
-        "search": (
-            "Guest searched properties. Data:\n"
-            f"{json.dumps(tool_output, default=str, ensure_ascii=False)}\n\n"
-            "Write concise, friendly results with name, nightly price in BDT, and 2 top amenities."
-        ),
         "details": (
-            "Guest requested listing details. Data:\n"
-            f"{json.dumps(tool_output, default=str, ensure_ascii=False)}\n\n"
-            "Write concise details with name, location, address, price in BDT, capacity, amenities, and host contact."
+            f"Property data: {json.dumps(tool_output, default=str, ensure_ascii=False)}\n"
+            "Write a friendly 3-4 sentence summary: name, location, price in ৳, "
+            "max guests, top amenities, host contact. "
+            "Then ask: 'To confirm your booking, please share your full name and phone number.'"
+        ),
+        "search": (
+            f"Search results: {json.dumps(tool_output, default=str, ensure_ascii=False)}\n"
+            "List each property numbered: 1. Name — ৳ price/night — top 2 amenities — max N guests. "
+            "If empty, apologise and suggest widening the search. "
+            "End with: 'Which property would you like to book? 😊'"
         ),
         "book": (
-            "Booking confirmed. Data:\n"
-            f"{json.dumps(tool_output, default=str, ensure_ascii=False)}\n\n"
-            "Write concise booking confirmation with booking ID, property, dates, guests, and total BDT."
+            f"Booking confirmation: {json.dumps(tool_output, default=str, ensure_ascii=False)}\n"
+            "Write a warm confirmation: Booking ID, property name, check-in, check-out, "
+            "total nights, guests, total ৳ price. Max 4 sentences."
         ),
     }
-    user_prompt = prompt_map.get(intent, f"Summarize for guest:\n{json.dumps(tool_output, default=str, ensure_ascii=False)}")
 
-    llm = _get_llm()
-    reply_text = str(
-        llm.invoke(
-            [
-                SystemMessage(content="You are StayEase assistant. Reply in clear and natural English."),
-                HumanMessage(content=user_prompt),
-            ]
-        ).content
-    ).strip()
-    return {"final_response": reply_text, "messages": [AIMessage(content=reply_text)]}
+    user_prompt = prompt_map.get(
+        intent,
+        f"Data: {json.dumps(tool_output, default=str, ensure_ascii=False)}\nSummarise for the guest in 2 sentences."
+    )
+    llm = _get_llm(with_tools=False)
+    result = llm.invoke([
+        SystemMessage(content="You are Riya, StayEase assistant. Reply friendly and concise. No markdown headers."),
+        HumanMessage(content=user_prompt),
+    ])
+    return result.content.strip()
 
 
-def escalation_node(state: AgentState) -> dict[str, Any]:
-    user_text = _last_user_message(state)
-    if _is_greeting_only(user_text):
-        return {
-            "final_response": (
-                "Hello! Welcome to StayEase. I can help with property search, listing details, "
-                "and bookings. Tell me your location, dates, and guests."
-            )
-        }
+# ── Node 1: input_node ────────────────────────────────────────────────────────
 
-    return {
-        "final_response": (
-            "Hello! I can help with StayEase property search, listing details, and bookings. "
-            "For other requests, please contact support@stayease.com.bd or 16700."
+def input_node(state: AgentState) -> dict[str, Any]:
+    """
+    Rebuild the SystemMessage every turn so the LLM always sees the latest
+    pending_booking status (updated across turns).
+    """
+    msgs = list(state.get("messages", []))
+
+    # Remove any stale SystemMessage — we'll prepend a fresh one
+    msgs = [m for m in msgs if not isinstance(m, SystemMessage)]
+
+    pending = state.get("pending_booking") or {}
+
+    if _is_small_model():
+        prompt_text = SYSTEM_PROMPT_JSON + f"\nToday: {date.today().isoformat()}"
+    else:
+        prompt_text = SYSTEM_PROMPT_TEMPLATE.format(
+            today=date.today().isoformat(),
+            pending_json=_pending_summary(pending),
         )
+
+    msgs = [SystemMessage(content=prompt_text)] + msgs
+    return {"messages": msgs, "error": None}
+
+
+# ── Node 2: agent_node ────────────────────────────────────────────────────────
+
+def agent_node(state: AgentState) -> dict[str, Any]:
+    if _is_small_model():
+        return _agent_node_json(state)
+    return _agent_node_tools(state)
+
+
+def _agent_node_tools(state: AgentState) -> dict[str, Any]:
+    """Path A: large tool-calling LLM."""
+    llm = _get_llm(with_tools=True)
+    ai_message: AIMessage = llm.invoke(state["messages"])
+
+    # Safety net: LLM described tools instead of calling them → force retry
+    if not ai_message.tool_calls and isinstance(ai_message.content, str):
+        bad_phrases = [
+            "parameters", "minLength", '"type": "object"',
+            "Here's how", "use the `", "tool with", "search_listings",
+        ]
+        if any(p in ai_message.content for p in bad_phrases):
+            retry = list(state["messages"]) + [
+                SystemMessage(content="You must call the correct tool NOW. Do not write anything else.")
+            ]
+            ai_message = llm.invoke(retry)
+
+    intent = _detect_intent(ai_message, state.get("intent", ""))
+
+    # Snapshot any guest info the LLM is passing into create_booking
+    pending = dict(state.get("pending_booking") or {})
+    if ai_message.tool_calls:
+        for call in ai_message.tool_calls:
+            args = call.get("args", {})
+            if call["name"] == "search_available_properties":
+                pending.update({
+                    "location":  args.get("location"),
+                    "check_in":  str(args.get("check_in", "")),
+                    "check_out": str(args.get("check_out", "")),
+                    "guests":    args.get("guests"),
+                })
+            elif call["name"] == "create_booking":
+                # Inject customer_id into the booking args so it's saved in DB
+                call["args"]["customer_id"] = state.get("customer_id")
+                pending.update({
+                    "guest_name":  args.get("guest_name"),
+                    "guest_phone": args.get("guest_phone"),
+                })
+
+    return {"messages": [ai_message], "intent": intent, "pending_booking": pending}
+
+
+def _agent_node_json(state: AgentState) -> dict[str, Any]:
+    """Path B: small model JSON fallback."""
+    llm = _get_llm(with_tools=False)
+    raw_ai: AIMessage = llm.invoke(state["messages"])
+    raw_text = raw_ai.content or ""
+
+    parsed = _extract_json(raw_text)
+    intent = parsed.get("intent", "escalate")
+    t_input = parsed.get("tool_input", {})
+
+    tool_name_map = {
+        "details": "get_listing_details_by_name",
+        "search":  "search_available_properties",
+        "book":    "create_booking",
+    }
+    tool_name = tool_name_map.get(intent)
+
+    pending = dict(state.get("pending_booking") or {})
+
+    if tool_name and t_input:
+        import uuid
+        synthetic = AIMessage(
+            content="",
+            tool_calls=[{"id": str(uuid.uuid4()), "name": tool_name, "args": t_input}],
+        )
+        return {"messages": [synthetic], "intent": intent, "tool_input": t_input, "pending_booking": pending}
+
+    # collect / escalate — return a canned response
+    if intent == "collect":
+        missing = []
+        if not pending.get("guest_name"):
+            missing.append("full name")
+        if not pending.get("guest_phone"):
+            missing.append("phone number")
+        ask = " and your ".join(missing)
+        reply_text = f"Could you please share your {ask} to complete the booking?"
+    else:
+        reply_text = (
+            "I can only help with StayEase property searches and bookings. "
+            "For anything else please contact support@stayease.com.bd or call 16700."
+        )
+
+    escalate_msg = AIMessage(content=reply_text)
+    return {"messages": [escalate_msg], "intent": intent, "pending_booking": pending}
+
+
+def _detect_intent(ai_message: AIMessage, current: str) -> str:
+    intent_map = {
+        "search_available_properties":  "search",
+        "get_listing_details":          "details",
+        "get_listing_details_by_name":  "details",
+        "search_listings_catalog":      "details",
+        "create_booking":               "book",
+    }
+    if ai_message.tool_calls:
+        return intent_map.get(ai_message.tool_calls[0]["name"], "details")
+    return current or "escalate"
+
+
+# ── Node 3: tool_node ─────────────────────────────────────────────────────────
+
+def tool_node(state: AgentState) -> dict[str, Any]:
+    """
+    Execute tool calls and return ToolMessages.
+    Also updates pending_booking with any newly discovered data
+    (check_in/check_out from search, listing_id from details, cleared on successful book).
+    """
+    last_msg: AIMessage = state["messages"][-1]
+    tool_messages = []
+    result = None
+    pending = dict(state.get("pending_booking") or {})
+
+    for call in last_msg.tool_calls:
+        tool_fn = TOOL_MAP.get(call["name"])
+        if tool_fn is None:
+            result = f"Error: tool '{call['name']}' not found."
+        else:
+            try:
+                result = tool_fn.invoke(call["args"])
+            except Exception as exc:
+                result = f"Tool error: {exc}"
+
+        # ── Update pending_booking from results ───────────────────────────
+        args = call.get("args", {})
+
+        if call["name"] == "search_available_properties":
+            # Save search params for later booking
+            pending.update({
+                "location":  args.get("location", pending.get("location")),
+                "check_in":  str(args.get("check_in", pending.get("check_in", ""))),
+                "check_out": str(args.get("check_out", pending.get("check_out", ""))),
+                "guests":    args.get("guests", pending.get("guests")),
+            })
+
+        elif call["name"] in ("get_listing_details", "get_listing_details_by_name"):
+            if isinstance(result, dict) and result.get("listing_id"):
+                pending["listing_id"]   = result["listing_id"]
+                pending["listing_name"] = result.get("name", "")
+                # Mark guest info as needed (ensure keys exist)
+                pending.setdefault("guest_name", None)
+                pending.setdefault("guest_phone", None)
+
+        elif call["name"] == "create_booking":
+            if isinstance(result, dict) and "booking_id" in result:
+                # Booking successful — clear pending state
+                pending = {}
+
+        tool_messages.append(ToolMessage(
+            content=json.dumps(result, default=str, ensure_ascii=False)
+                    if not isinstance(result, str) else result,
+            tool_call_id=call["id"],
+            name=call["name"],
+        ))
+
+    updates: dict[str, Any] = {
+        "messages":       tool_messages,
+        "tool_output":    json.dumps(result, default=str, ensure_ascii=False)
+                          if result is not None and not isinstance(result, str) else (result or ""),
+        "pending_booking": pending,
     }
 
+    # Small-model path: format the reply here so we skip the LLM loop
+    if _is_small_model():
+        intent = state.get("intent", "details")
+        reply = _format_reply(intent, result, None)
+        final_ai = AIMessage(content=reply)
+        updates["messages"] = tool_messages + [final_ai]
+        updates["final_response"] = reply
+
+    return updates
+
+
+# ── Node 4: response_node ─────────────────────────────────────────────────────
+
+def response_node(state: AgentState) -> dict[str, Any]:
+    """Extract the last AIMessage as the guest-facing reply."""
+    if state.get("final_response"):
+        return {}
+    last_msg = state["messages"][-1]
+    if isinstance(last_msg, AIMessage) and last_msg.content:
+        return {"final_response": last_msg.content.strip()}
+    return {"final_response": "Sorry, I couldn't process that. Please try again or call 16700."}
+
+
+# ── Edge helper ───────────────────────────────────────────────────────────────
+
+def should_continue(state: AgentState) -> str:
+    """Route after agent_node: pending tool call → tool_node, else → response_node."""
+    if state.get("final_response"):
+        return "response_node"
+    last_msg = state["messages"][-1]
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        return "tool_node"
+    return "response_node"

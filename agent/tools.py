@@ -2,12 +2,13 @@
 agent/tools.py
 --------------
 LangChain @tool definitions for the three core StayEase operations.
-Each tool wraps a direct PostgreSQL query (via SQLAlchemy / psycopg2).
+Each tool wraps a direct PostgreSQL query.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from typing import Any
 
@@ -62,6 +63,15 @@ class BookingInput(BaseModel):
     check_in: date = Field(..., description="Arrival date in YYYY-MM-DD format")
     check_out: date = Field(..., description="Departure date in YYYY-MM-DD format")
     guests: int = Field(..., ge=1, le=20, description="Number of guests")
+    customer_id: str | None = Field(default=None, description="Customer ID for the session (optional, linked automatically)")
+
+
+class CatalogSearchInput(BaseModel):
+    """Broad text search for listings when user asks general questions."""
+
+    query: str = Field(..., min_length=1, description="Free-text query from user message")
+    location: str | None = Field(default=None, description="Optional location filter")
+    limit: int = Field(default=5, ge=1, le=10, description="Maximum number of rows")
 
 
 # ── Tool 1 — search ───────────────────────────────────────────────────────────
@@ -154,7 +164,14 @@ def get_listing_details_by_name(listing_name: str, location: str | None = None) 
     Retrieve full details for a listing by fuzzy name (optionally narrowed by location).
     Returns {} when no active listing matches.
     """
-    clean_name = listing_name.strip()
+    clean_name = re.sub(r"\s+", " ", listing_name.strip())
+    clean_name = re.sub(
+        r"\b(information|info|details?|tell me|please|about)\b",
+        " ",
+        clean_name,
+        flags=re.IGNORECASE,
+    )
+    clean_name = re.sub(r"\s+", " ", clean_name).strip()
     clean_location = location.strip() if isinstance(location, str) and location.strip() else None
 
     sql = """
@@ -172,7 +189,10 @@ def get_listing_details_by_name(listing_name: str, location: str | None = None) 
         FROM listings
         WHERE
             is_active = TRUE
-            AND LOWER(name) LIKE LOWER(%(name_like)s)
+            AND (
+                LOWER(name) LIKE LOWER(%(name_like)s)
+                OR LOWER(%(name_text)s) LIKE CONCAT('%%', LOWER(name), '%%')
+            )
             AND (
                 %(location)s IS NULL
                 OR LOWER(location) LIKE LOWER(%(location_like)s)
@@ -181,7 +201,8 @@ def get_listing_details_by_name(listing_name: str, location: str | None = None) 
             CASE
                 WHEN LOWER(name) = LOWER(%(name_exact)s) THEN 0
                 WHEN LOWER(name) LIKE LOWER(%(name_prefix)s) THEN 1
-                ELSE 2
+                WHEN LOWER(%(name_text)s) LIKE CONCAT('%%', LOWER(name), '%%') THEN 2
+                ELSE 3
             END,
             LENGTH(name) ASC
         LIMIT 1;
@@ -191,6 +212,7 @@ def get_listing_details_by_name(listing_name: str, location: str | None = None) 
             sql,
             {
                 "name_like": f"%{clean_name}%",
+                "name_text": clean_name,
                 "name_exact": clean_name,
                 "name_prefix": f"{clean_name}%",
                 "location": clean_location,
@@ -199,6 +221,76 @@ def get_listing_details_by_name(listing_name: str, location: str | None = None) 
         )
         row = cur.fetchone()
     return dict(row) if row else {}
+
+
+@tool("search_listings_catalog", args_schema=CatalogSearchInput)
+def search_listings_catalog(query: str, location: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    """
+    Search listings catalog by free text over name/location/address/description.
+    Useful for receptionist-style "tell me about X" requests.
+    """
+    clean_query = re.sub(r"\s+", " ", query.strip())
+    clean_location = location.strip() if isinstance(location, str) and location.strip() else None
+    terms = [t for t in re.split(r"\s+", clean_query) if t]
+    if not terms:
+        return []
+
+    with _get_conn() as conn, conn.cursor() as cur:
+        # Build dynamic AND clauses for all terms so noisy phrases still match a known listing name.
+        term_clauses = []
+        params: dict[str, Any] = {
+            "location": clean_location,
+            "location_like": f"%{clean_location}%" if clean_location else None,
+            "limit": limit,
+            "whole_query": f"%{clean_query}%",
+            "query_exact": clean_query,
+        }
+        for idx, term in enumerate(terms):
+            key = f"term_{idx}"
+            params[key] = f"%{term}%"
+            term_clauses.append(
+                f"""(
+                    LOWER(l.name) LIKE LOWER(%({key})s)
+                    OR LOWER(l.location) LIKE LOWER(%({key})s)
+                    OR LOWER(COALESCE(l.address, '')) LIKE LOWER(%({key})s)
+                    OR LOWER(COALESCE(l.description, '')) LIKE LOWER(%({key})s)
+                )"""
+            )
+
+        term_sql = " OR ".join(term_clauses)
+        sql = f"""
+            SELECT
+                l.id AS listing_id,
+                l.name,
+                l.location,
+                l.address,
+                l.description,
+                l.price_per_night_bdt,
+                l.max_guests,
+                l.amenities
+            FROM listings l
+            WHERE
+                l.is_active = TRUE
+                AND (
+                    %(location)s IS NULL
+                    OR LOWER(l.location) LIKE LOWER(%(location_like)s)
+                )
+                AND (
+                    LOWER(l.name) LIKE LOWER(%(whole_query)s)
+                    OR ({term_sql})
+                )
+            ORDER BY
+                CASE
+                    WHEN LOWER(l.name) = LOWER(%(query_exact)s) THEN 0
+                    WHEN LOWER(l.name) LIKE LOWER(%(whole_query)s) THEN 1
+                    ELSE 2
+                END,
+                LENGTH(l.name) ASC
+            LIMIT %(limit)s;
+        """
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Tool 3 — book ─────────────────────────────────────────────────────────────
@@ -211,6 +303,7 @@ def create_booking(
     check_in: date,
     check_out: date,
     guests: int,
+    customer_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new booking in the database after verifying availability.
@@ -248,16 +341,18 @@ def create_booking(
         if cur.fetchone():
             raise ValueError("Property is no longer available for the selected dates")
 
-        # 3. Insert booking
+        # 3. Insert booking (with optional customer_id link)
         total = float(listing["price_per_night_bdt"]) * nights
         cur.execute(
             """
             INSERT INTO bookings
-                (listing_id, guest_name, guest_phone, check_in, check_out, guests, total_price_bdt, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed')
+                (listing_id, customer_id, guest_name, guest_phone,
+                 check_in, check_out, guests, total_price_bdt, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
             RETURNING id
             """,
-            (listing_id, guest_name, guest_phone, check_in, check_out, guests, total),
+            (listing_id, customer_id, guest_name, guest_phone,
+             check_in, check_out, guests, total),
         )
         booking_id = cur.fetchone()["id"]
         conn.commit()
@@ -276,5 +371,11 @@ def create_booking(
 
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
-ALL_TOOLS = [search_available_properties, get_listing_details, get_listing_details_by_name, create_booking]
+ALL_TOOLS = [
+    search_available_properties,
+    get_listing_details,
+    get_listing_details_by_name,
+    search_listings_catalog,
+    create_booking,
+]
 TOOL_MAP: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
