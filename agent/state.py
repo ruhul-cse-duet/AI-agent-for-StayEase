@@ -23,7 +23,7 @@ class AgentState(TypedDict):
     This is the path parameter in /api/chat/{customer_id}/message.
     """
 
-    conversation_id: int
+    conversation_id: int | str
     """
     Auto-increment PK of the current row in the conversations table.
     Resolved by main.py from customer_id on each request.
